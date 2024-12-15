@@ -26,6 +26,8 @@ import shutil
 
 mpiexec_cmd = os.environ.get("MPITX_MPIEXEC", "mpiexec")
 tmux_cmd = os.environ.get("MPITX_TMUX", "tmux")
+RANK_ID = "RANK_ID"
+RANK_SIZE = "RANK_SIZE"
 
 # Utils
 # -----------------------------------------------------------------------------
@@ -72,20 +74,20 @@ def deserialize(obj_str):
     return pickle.loads(base64.b64decode(obj_str.encode()))
 
 def get_mpi_rank():
-    rank_envs = ["OMPI_COMM_WORLD_RANK", "PMI_RANK", "PMIX_RANK", "OMPI_MCA_orte_ess_vpid"]
-    for rank_env in rank_envs:
-        rank = os.environ.get(rank_env)
-        if rank:
-            return int(rank)
+    # rank_envs = [RANK_ID, "OMPI_COMM_WORLD_RANK", "PMI_RANK", "PMIX_RANK", "OMPI_MCA_orte_ess_vpid"]
+    rank = os.environ.get(RANK_ID)
+    print(rank)
+    if rank:
+        return int(rank)
     show_error("Could not get an MPI rank from environment variables.")
     exit(1)
 
 def get_mpi_size():
-    size_envs = ["OMPI_COMM_WORLD_SIZE", "PMI_SIZE", "PMIX_SIZE", "OMPI_MCA_orte_ess_num_procs"]
-    for size_env in size_envs:
-        size = os.environ.get(size_env)
-        if size:
-            return int(size)
+    # size_envs = ["OMPI_COMM_WORLD_SIZE", "PMI_SIZE", "PMIX_SIZE", "OMPI_MCA_orte_ess_num_procs"]
+    # for size_env in size_envs:
+    size = os.environ.get(RANK_SIZE)
+    if size:
+        return int(size)
     show_error("Could not get an MPI size from environment variables.")
     exit(1)
 
@@ -189,12 +191,19 @@ def accept_with_token(sock, token):
                 conn.close()
 
 def establish_connection_on_parent(on_listen_hook):
+    """
+    as a server
+    listen
+
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("0.0.0.0", 0))
         s.listen()
         (_, port) = s.getsockname()
         token = secrets.token_hex()
+        # pass out the port and token
+        # token is used as a identity
         on_listen_hook(port, token)
 
         conns = dict()
@@ -269,6 +278,7 @@ def recv_termsize(s):
 
 def wait_on_tmux_pane(on_listen_hook):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        # this server is created in tmux sub process 
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("0.0.0.0", 0))
         s.listen()
@@ -320,9 +330,11 @@ def launch_reverse_shell(host, port, token, commands):
 
         ts = recv_termsize(s)
 
+        # create a child, exec command in child.
         pid, fd = pty.fork()
         if pid == 0:
             set_termsize(sys.stdin.fileno(), ts)
+            print(get_mpi_rank())
             os.execlp(commands[0], *commands)
 
         t = threading.Thread(target=watch_window_size, args=(fd,))
@@ -347,6 +359,7 @@ def main():
 
         for host in args["hosts"]:
             if is_host_connectable(host, args["port"]):
+                # get rank_id, and connect to server
                 with establish_connection_to_parent(host, args["port"], args["token"],
                                                     get_mpi_rank(), get_mpi_size()) as parent_conn:
                     tmux_args = deserialize(recv_with_size(parent_conn).decode())
@@ -356,10 +369,12 @@ def main():
     elif sys.argv[1] == tmux_subcmd:
         # Process on each tmux pane
         args = deserialize(sys.argv[2])
-
+        print("huhu")
         def notify_parent(port, token):
+            # notify tmux process with tmux-subprocess's tmux_args
             with establish_connection_to_parent("127.0.0.1", args["port"], args["token"],
                                                 args["mpi_rank"], args["mpi_size"]) as conn:
+                # tmux_args tells how to connect to tmux subprocess server
                 tmux_args = dict(port=port, token=token)
                 send_with_size(conn, serialize(tmux_args).encode())
 
@@ -376,14 +391,25 @@ def main():
 
         (this_cmd, options, commands) = parse_args(sys.argv)
 
-        mpiexec_process = None
+        # process which run mpiexec command(subprocess run child_cmd)
+        # mpiexec_process = None
+        fork_pids = []
 
         def launch_mpiexec(port, token):
-            nonlocal mpiexec_process
+            # nonlocal mpiexec_process
             hosts = ["127.0.0.1"] + get_ip_addresses()
             args = dict(commands=commands, hosts=hosts, port=port, token=token)
-            mpiexec_process = subprocess.Popen([mpiexec_cmd] + options + [this_cmd, child_subcmd, serialize(args)],
-                                               start_new_session=True)
+            # TODO: replace this with fork
+            for i in range(4):
+                pid = os.fork()
+                if pid == 0:
+                    env = os.environ.copy()
+                    env[RANK_ID] = str(i)
+                    env[RANK_SIZE] = str(4)
+                    os.execve(this_cmd, [this_cmd, child_subcmd, serialize(args)], env)
+                fork_pids.append(pid)
+            # mpiexec_process = subprocess.Popen([mpiexec_cmd] + options + [this_cmd, child_subcmd, serialize(args)],
+            #                                    start_new_session=True)
 
         child_conns = establish_connection_on_parent(launch_mpiexec)
 
@@ -399,25 +425,26 @@ def main():
                 if rank == 0:
                     tmux_kill_pane(dummy_pane_id)
 
+        # extablish another server, used to recive tmux process
         tmux_conns = establish_connection_on_parent(create_tmux_panes)
 
         for rank, conn in sorted(tmux_conns.items()):
             tmux_msg = recv_with_size(conn)
             send_with_size(child_conns[rank], tmux_msg)
 
-        try:
-            mpiexec_process.wait()
-        except KeyboardInterrupt:
-            pgid = os.getpgid(mpiexec_process.pid)
-            os.killpg(pgid, signal.SIGINT)
-            mpiexec_process.wait()
-            print("Interrupted.")
+        # try:
+        #     mpiexec_process.wait()
+        # except KeyboardInterrupt:
+        #     pgid = os.getpgid(mpiexec_process.pid)
+        #     os.killpg(pgid, signal.SIGINT)
+        #     mpiexec_process.wait()
+        #     print("Interrupted.")
 
-        for conn in child_conns.values():
-            conn.close()
+        # for conn in child_conns.values():
+        #     conn.close()
 
-        for conn in tmux_conns.values():
-            conn.close()
+        # for conn in tmux_conns.values():
+        #     conn.close()
 
 if __name__ == "__main__":
     main()
